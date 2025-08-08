@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Campfire Deduction Expanded — Roles Aligned v1.8.2</title>
+<style>
+  :root{--bg:#222}
+  html,body{height:100%}
+  body{font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:#fff;margin:0;padding:16px;text-align:center}
+  #hud{margin-bottom:8px}
+  #board{background:#333;border:2px solid #555;border-radius:50%;cursor:pointer;max-width:95vw;height:auto}
+  #controls{margin-top:10px}
+  #log{max-height:220px;overflow:auto;text-align:left;margin-top:10px}
+  button{margin:4px}
+  .muted{opacity:.6}
+  .row{display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap}
+  label.toggle{user-select:none;display:inline-flex;align-items:center;gap:6px}
+</style>
+</head>
+<body>
+<h1>Campfire Deduction Expanded — Roles Aligned v1.8.2</h1>
+<div class="row">
+  <div id="hud">HP: <span id="hp">10</span> | Mafia left: <span id="mafiaLeft">0</span> | Round: <span id="round">0</span></div>
+</div>
+<div class="row">
+  <button id="btnStart">Start / Reset</button>
+  <button id="btnNext" class="muted" title="Kept for future rounds; does nothing now">Next Round</button>
+  <label class="toggle"><input type="checkbox" id="debugReveal"> Debug colors</label>
+</div>
+<canvas id="board" width="820" height="560"></canvas>
+<div id="controls">
+  <div id="sel"><strong id="selName">No seat selected</strong> <span id="selBadges"></span></div>
+  <div>
+    <button id="btnQuestion" disabled>Question</button>
+    <button id="btnExecute" disabled>Execute</button>
+    <button id="btnSkill" disabled>Use Skill</button>
+    <button id="btnCancel" disabled>Cancel Targeting</button>
+  </div>
+</div>
+<div id="log"></div>
+
+<script>
+(function(){
+  const ALIGN = { TOWN:'TOWN', MAFIA:'MAFIA' };
+  const ROLES = {
+    VILLAGER:'Villager', CONFESSOR:'Confessioner', PLAGUE_DOCTOR:'Plague Doctor', DOCTOR:'Doctor',
+    POISONER:'Poisoner', JUDGE:'Judge', EXECUTIONER:'Executioner', KNIGHT:'Knight', MAFIOSO:'Mafioso', MEDIUM:'Medium'
+  };
+  const VILLAGE_ROLES_FOR_DISGUISE = [ROLES.VILLAGER, ROLES.CONFESSOR, ROLES.DOCTOR, ROLES.JUDGE, ROLES.EXECUTIONER, ROLES.KNIGHT, ROLES.MEDIUM];
+
+  const el=id=>document.getElementById(id);
+  const canvas=el('board'); const ctx=canvas.getContext('2d'); const logEl=el('log');
+
+  const state={ players:[], hp:10, round:0, selected:null, targeting:null, seats:[] };
+  window.state=state; // for debugging
+
+  // =================== Setup ===================
+  function setupGame(){
+    state.players=[]; state.hp=10; state.round=0; state.selected=null; state.targeting=null; state.seats=[];
+    const roles=[ROLES.CONFESSOR, ROLES.PLAGUE_DOCTOR, ROLES.DOCTOR, ROLES.JUDGE, ROLES.EXECUTIONER, ROLES.KNIGHT, ROLES.VILLAGER, ROLES.MEDIUM, ROLES.POISONER, ROLES.MAFIOSO];
+    for(let i=0;i<roles.length;i++){
+      const role=roles[i];
+      const align=(role===ROLES.POISONER||role===ROLES.MAFIOSO)?ALIGN.MAFIA:ALIGN.TOWN; // PD is Good (Outcast), count as non-Mafia
+      state.players.push({ id:i, role, shownRole:role, align, alive:true, infected:false, cured:0, hasPoisoned:false, lastStatement:'' });
+    }
+
+    // Disguises for Mafioso and Poisoner (random Village role appearance)
+    const maf=state.players.find(p=>p.role===ROLES.MAFIOSO);
+    const poi=state.players.find(p=>p.role===ROLES.POISONER);
+    if(maf){ maf.shownRole = pick(VILLAGE_ROLES_FOR_DISGUISE); }
+    if(poi){ poi.shownRole = pick(VILLAGE_ROLES_FOR_DISGUISE); }
+
+    // Start-of-game effects
+    const pd=state.players.find(p=>p.role===ROLES.PLAGUE_DOCTOR && p.alive);
+    if(pd){ const t=randomAliveExcept(pd.id); if(t){ t.infected=true; pd._infectedId=t.id; log('A sickness spreads in the night.'); } }
+    if(poi){ const L=neighbor(poi.id,-1), R=neighbor(poi.id,1); const opts=[L,R].filter(x=>x&&x.alive&&!x.infected&&x.align===ALIGN.TOWN); if(opts.length){ const tgt=pick(opts); tgt.infected=true; poi.hasPoisoned=true; poi._poisonedId=tgt.id; log('Whispered poison reaches a neighbor.'); } }
+    const med=state.players.find(p=>p.role===ROLES.MEDIUM && p.alive);
+    if(med){ const t=randomAliveExcept(med.id); if(t){ log('Medium: Seat '+t.id+' is real '+t.shownRole+'.'); } }
+
+    updateHud(); draw(); setSelection(null);
+    log('New game. Click a seat, then use the buttons.');
+  }
+
+  // =================== Drawing ===================
+  function useDebugColors(){ const cb=el('debugReveal'); return !!(cb && cb.checked); }
+  function layoutSeats(){ const n=state.players.length; state.seats=[]; const cx=canvas.width/2, cy=canvas.height/2; const R=Math.min(cx,cy)-70; for(let i=0;i<n;i++){ const a=(i/n)*Math.PI*2 - Math.PI/2; const x=cx+R*Math.cos(a), y=cy+R*Math.sin(a); state.seats.push({x,y,r:34,id:i}); } }
+  function draw(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.save(); ctx.strokeStyle='#444'; ctx.setLineDash([8,8]); ctx.lineWidth=2; ctx.beginPath(); ctx.ellipse(canvas.width/2,canvas.height/2, Math.min(canvas.width,canvas.height)/2-10, Math.min(canvas.width,canvas.height)/2-10, 0,0,Math.PI*2); ctx.stroke(); ctx.restore();
+    if(!state.seats.length) layoutSeats();
+    const dbg=useDebugColors();
+    for(const seat of state.seats){ const p=state.players[seat.id];
+      ctx.beginPath(); ctx.arc(seat.x,seat.y,seat.r,0,Math.PI*2);
+      if(!p.alive){ ctx.fillStyle = '#555'; }
+      else if(dbg){ ctx.fillStyle = (p.align===ALIGN.MAFIA) ? '#a33' : '#3a3'; }
+      else { ctx.fillStyle = '#777'; }
+      ctx.fill();
+      ctx.lineWidth=3; ctx.strokeStyle=p.infected?'#c6f':'#fff'; ctx.stroke();
+      ctx.font='13px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.strokeStyle='#000'; ctx.lineWidth=4; ctx.strokeText(p.shownRole, seat.x, seat.y);
+      ctx.fillStyle='#fff'; ctx.fillText(p.shownRole, seat.x, seat.y);
+    }
+    if(state.selected!=null){ const s=state.seats[state.selected]; if(s){ ctx.save(); ctx.setLineDash([4,4]); ctx.strokeStyle='#ffb84d'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(s.x,s.y,s.r+6,0,Math.PI*2); ctx.stroke(); ctx.restore(); }}
+  }
+
+  function toCanvas(e){ const r=canvas.getBoundingClientRect(); const sx=canvas.width/r.width, sy=canvas.height/r.height; return {x:(e.clientX-r.left)*sx, y:(e.clientY-r.top)*sy}; }
+  function hit(x,y){ if(!state.seats.length) layoutSeats(); for(const s of state.seats){ const dx=x-s.x, dy=y-s.y; if(dx*dx+dy*dy<=s.r*s.r) return s.id; } return null; }
+  canvas.addEventListener('click', e=>{ const p=toCanvas(e); const id=hit(p.x,p.y); if(state.targeting!=null && id!=null){ applySkill(state.targeting,id); return; } setSelection(id); });
+  canvas.addEventListener('mousemove', e=>{ const p=toCanvas(e); const id=hit(p.x,p.y); canvas.style.cursor=(id!=null||state.targeting!=null)?'pointer':'default'; });
+  const cb=el('debugReveal'); if(cb){ cb.addEventListener('change', draw); }
+
+  // =================== Selection & HUD ===================
+  function setSelection(id){ state.selected=id; const name=el('selName'), badges=el('selBadges'); if(id==null){ name.textContent='No seat selected'; badges.textContent=''; } else { const p=state.players[id]; name.textContent=p.shownRole; badges.textContent=' '+(p.alive?'(Alive)':'(Dead)')+(p.infected?' — Infected':''); } updateButtons(); draw(); }
+  function updateHud(){ el('hp').textContent=state.hp; el('mafiaLeft').textContent=state.players.filter(p=>p.alive && p.align===ALIGN.MAFIA).length; el('round').textContent=state.round; }
+  function updateButtons(){ const id=state.selected; const p=(id==null)?null:state.players[id]; const q=el('btnQuestion'), ex=el('btnExecute'), s=el('btnSkill'), c=el('btnCancel'); c.disabled=(state.targeting==null); if(!p){ q.disabled=ex.disabled=s.disabled=true; return; } q.disabled=!p.alive; const knightImmune=(p.role===ROLES.KNIGHT && !p.infected); ex.disabled=!p.alive || knightImmune; const canSkill=!p.infected && hasSkill(p); s.disabled=!p.alive || !canSkill || (p.role===ROLES.POISONER && p.hasPoisoned); }
+
+  // =================== Speech & Actions ===================
+  function question(){ if(state.selected==null) return; const p=state.players[state.selected]; if(!p.alive){ log(p.shownRole+' is dead.'); return; }
+    let s='';
+    if(p.infected){
+      if(p.role===ROLES.CONFESSOR){ s='I am good.'; }
+      else if(p.role===ROLES.KNIGHT){ s='I am the Knight.'; }
+      else { s=randomOpinion(p,true); }
+    } else {
+      switch(p.role){
+        case ROLES.VILLAGER: s=randomOpinion(p,false); break;
+        case ROLES.CONFESSOR: s='I am good.'; break;
+        case ROLES.PLAGUE_DOCTOR: s='Bring me someone to check.'; break;
+        case ROLES.JUDGE: s=''; break;
+        case ROLES.DOCTOR: s='I have cured '+p.cured+'.'; break;
+        case ROLES.EXECUTIONER: s=''; break;
+        case ROLES.KNIGHT: s='I am the Knight.'; break;
+        case ROLES.MEDIUM: s='I sense truths around the fire.'; break;
+        case ROLES.POISONER: case ROLES.MAFIOSO: s=randomOpinion(p,true); break;
+      }
+    }
+    if(s){ p.lastStatement=s; log(p.shownRole+': "'+s+'"'); }
+  }
+
+  function randomOpinion(speaker,forceLie){ const target=pick(state.players.filter(x=>x.id!==speaker.id)); if(!target) return '...'; const claimGood=Math.random()<0.5; const truth=(claimGood && target.align!==ALIGN.MAFIA) || (!claimGood && target.align===ALIGN.MAFIA); const finalTruth=forceLie ? !truth : truth; return target.shownRole+' is '+(finalTruth ? (claimGood?'good.':'evil.') : (claimGood?'evil.':'good.')); }
+
+  function execute(){ if(state.selected==null) return; const p=state.players[state.selected]; if(!p.alive){ log(p.shownRole+' is already dead.'); return; } if(p.role===ROLES.KNIGHT && !p.infected){ log('The Knight survives!'); return; } p.alive=false; if(p.align===ALIGN.TOWN){ state.hp=(state.hp===10)?5:0; } updateHud(); draw(); checkWinLose(); }
+
+  function startSkill(){ if(state.selected==null) return; const p=state.players[state.selected]; if(!p.alive || p.infected || !hasSkill(p)) return; if(p.role===ROLES.DOCTOR){ const L=neighbor(p.id,-1), R=neighbor(p.id,1); let cured=0; [L,R].forEach(t=>{ if(t && t.alive && t.infected){ t.infected=false; cured++; p.cured++; }}); if(cured>0){ log('Doctor cured '+cured+' neighbor'+(cured>1?'s':'')+'. Total cured: '+p.cured+'.'); draw(); } else { log('Doctor found no infected neighbors.'); } updateButtons(); return; } state.targeting=p.id; el('btnCancel').disabled=false; log('Select a target for '+p.shownRole+'.'); }
+  function cancelTargeting(){ state.targeting=null; el('btnCancel').disabled=true; }
+
+  function applySkill(casterId,targetId){ const caster=state.players[casterId], target=state.players[targetId]; if(!caster.alive || caster.infected){ log('Skill unavailable.'); cancelTargeting(); return; }
+    switch(caster.role){
+      case ROLES.PLAGUE_DOCTOR:
+        if(!target.alive){ log('Cannot check the dead.'); }
+        else if(targetId===casterId){ log('Plague Doctor: I am good.'); }
+        else if(typeof caster._infectedId==='number' && caster._infectedId===targetId){ const who=state.players[caster._infectedId]; const evilKnown=state.players.find(p=>p.align===ALIGN.MAFIA && p.alive); log('Plague Doctor: '+who.shownRole+' is infected. '+(evilKnown? (evilKnown.shownRole+' is evil.') : '')); }
+        else { log('Plague Doctor: '+target.shownRole+' is not infected.'); }
+        break;
+      case ROLES.JUDGE:
+        if(!target.lastStatement){ /* says nothing */ }
+        else { const isTrue=evaluateTruth(target, target.lastStatement); log('Judge: That was '+(isTrue?'true':'a lie')+'.'); }
+        break;
+      case ROLES.EXECUTIONER:
+        if(!target.alive){ log('Target already dead.'); break; }
+        if(target.role===ROLES.KNIGHT && !target.infected){ log('He can’t kill that person.'); break; }
+        if(target.align===ALIGN.MAFIA){ target.alive=false; log('Executioner slays the evil.'); draw(); updateHud(); checkWinLose(); }
+        else { log('He can’t kill that person.'); }
+        break;
+      case ROLES.POISONER:
+        log('Poisoner acts at game start only.');
+        break;
+      default: break;
+    }
+    cancelTargeting(); updateButtons();
+  }
+
+  function hasSkill(p){ return [ROLES.PLAGUE_DOCTOR, ROLES.JUDGE, ROLES.EXECUTIONER, ROLES.DOCTOR].indexOf(p.role)!==-1; }
+
+  // Judge truth-eval for common lines (escape backslashes in strings)
+  function evaluateTruth(speaker,line){
+    if(!line) return false;
+    if(line==='I am good.') return speaker.align!==ALIGN.MAFIA && !speaker.infected;
+    if(line==='I feel dizzy…') return (speaker.infected || speaker.align===ALIGN.MAFIA);
+    var mC=new RegExp('^I have cured (\d+)\.$').exec(line);
+    if(mC){ return Number(mC[1])===speaker.cured; }
+    var m=new RegExp('^([A-Za-z0-9 ]+) is (good|evil)\.$').exec(line);
+    if(m){ const target=state.players.find(p=>p.shownRole===m[1]); if(!target) return false; const claimGood=(m[2]==='good'); const isEvil=(target.align===ALIGN.MAFIA); return claimGood ? !isEvil : isEvil; }
+    return false;
+  }
+
+  function roleName(p){ return p.shownRole; }
+  function checkWinLose(){ const mafiaLeft=state.players.filter(p=>p.alive && p.align===ALIGN.MAFIA).length; if(mafiaLeft===0) log('Victory! All mafia eliminated.'); if(state.hp<=0) log('You lose.'); }
+  function log(msg){ const d=document.createElement('div'); d.textContent=msg; logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight; }
+
+  // =================== Helpers ===================
+  function pick(a){ return a[Math.floor(Math.random()*a.length)]; }
+  function randomAliveExcept(id){ const a=state.players.filter(p=>p.alive && p.id!==id); return a.length?pick(a):null; }
+  function neighbor(id,off){ const n=state.players.length; return state.players[(id+off+n)%n]; }
+
+  // =================== UI Wiring ===================
+  el('btnStart').onclick=setupGame; el('btnNext').onclick=function(){};
+  el('btnQuestion').onclick=question; el('btnExecute').onclick=execute; el('btnSkill').onclick=startSkill; el('btnCancel').onclick=cancelTargeting;
+
+  // =================== Self-tests (light) ===================
+  function selfTests(){ const results=[]; const assert=(c,m)=>results.push({ok:!!c,msg:m}); setupGame(); const poi=state.players.find(p=>p.role===ROLES.POISONER); if(poi && typeof poi._poisonedId==='number'){ assert(state.players[poi._poisonedId].align===ALIGN.TOWN,'poisoner targets town only'); } const pd=state.players.find(p=>p.role===ROLES.PLAGUE_DOCTOR); assert(typeof pd._infectedId==='number','pd infected set'); const doc=state.players.find(p=>p.role===ROLES.DOCTOR); const L=neighbor(doc.id,-1), R=neighbor(doc.id,1); if(L) L.infected=true; if(R) R.infected=true; const before=doc.cured; state.selected=doc.id; startSkill(); assert(doc.cured===before+(L?1:0)+(R?1:0),'doctor cures neighbors'); log('Self-tests: '+results.filter(r=>r.ok).length+'/'+results.length+' passed.'); }
+
+  // Init
+  setupGame(); selfTests();
+})();
+</script>
+</body>
+</html>
